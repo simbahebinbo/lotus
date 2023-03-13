@@ -234,7 +234,37 @@ func (a *EthModule) EthGetBlockByHash(ctx context.Context, blkHash ethtypes.EthH
 	return newEthBlockFromFilecoinTipSet(ctx, ts, fullTxInfo, a.Chain, a.StateAPI)
 }
 
-func (a *EthModule) parseBlkParam(ctx context.Context, blkParam string, strict bool) (tipset *types.TipSet, err error) {
+// blkParamToTipsetAfter returns the next non-nil tipset after the given block param.
+func (a *EthModule) blkParamToTipsetAfter(ctx context.Context, blkParam string) (*types.TipSet, error) {
+	switch blkParam {
+	case "earliest", "pending":
+		return nil, fmt.Errorf("block param %q is not supported", blkParam)
+	}
+
+	head := a.Chain.GetHeaviestTipSet()
+	switch blkParam {
+	case "latest":
+		return head, nil
+	default:
+		var num ethtypes.EthUint64
+		err := num.UnmarshalJSON([]byte(`"` + blkParam + `"`))
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse block number: %v", err)
+		}
+		height := abi.ChainEpoch(num + 1)
+		if height > head.Height() {
+			return nil, fmt.Errorf("requested a future epoch (beyond 'latest')")
+		}
+		ts, err := a.ChainAPI.ChainGetTipSetAfterHeight(ctx, height, head.Key())
+		if err != nil {
+			return nil, fmt.Errorf("cannot get tipset at height: %v", num)
+		}
+		return ts, nil
+	}
+}
+
+// blkParamToTipsetAfter returns the tipset at the given epoch.
+func (a *EthModule) blkParamToTipset(ctx context.Context, blkParam string, strict bool) (tipset *types.TipSet, err error) {
 	switch blkParam {
 	case "earliest", "pending":
 		return nil, fmt.Errorf("block param %q is not supported", blkParam)
@@ -269,7 +299,7 @@ func (a *EthModule) parseBlkParam(ctx context.Context, blkParam string, strict b
 }
 
 func (a *EthModule) EthGetBlockByNumber(ctx context.Context, blkParam string, fullTxInfo bool) (ethtypes.EthBlock, error) {
-	ts, err := a.parseBlkParam(ctx, blkParam, true)
+	ts, err := a.blkParamToTipset(ctx, blkParam, true)
 	if err != nil {
 		return ethtypes.EthBlock{}, err
 	}
@@ -375,7 +405,15 @@ func (a *EthModule) EthGetTransactionCount(ctx context.Context, sender ethtypes.
 		return ethtypes.EthUint64(0), nil
 	}
 
-	ts, err := a.parseBlkParam(ctx, blkParam, false)
+	// We don't allow looking up pending state, so we look up the "latest" state. But we need to
+	// remember that we actually wanted pending state (we may need to use the message pool to
+	// get the latest pending nonce).
+	effectiveBlkParam := blkParam
+	if effectiveBlkParam == "pending" {
+		effectiveBlkParam = "latest"
+	}
+
+	ts, err := a.blkParamToTipsetAfter(ctx, effectiveBlkParam)
 	if err != nil {
 		return ethtypes.EthUint64(0), xerrors.Errorf("cannot parse block param: %s", blkParam)
 	}
@@ -387,6 +425,11 @@ func (a *EthModule) EthGetTransactionCount(ctx context.Context, sender ethtypes.
 		}
 		return 0, xerrors.Errorf("failed to lookup contract %s: %w", sender, err)
 	} else if builtinactors.IsEvmActor(actor.Code) {
+		if blkParam == "pending" {
+			// Ok, were we actually looking for the pending txn count? If so, we have to
+			// bail here. We're actually looking at head-1.
+			return 0, xerrors.Errorf("cannot lookup pending transaction count for an EVM actor")
+		}
 		evmState, err := builtinevm.Load(a.Chain.ActorStore(ctx), actor)
 		if err != nil {
 			return 0, xerrors.Errorf("failed to load evm state: %w", err)
@@ -398,13 +441,16 @@ func (a *EthModule) EthGetTransactionCount(ctx context.Context, sender ethtypes.
 		}
 		nonce, err := evmState.Nonce()
 		return ethtypes.EthUint64(nonce), err
+	} else if blkParam == "pending" {
+		// If the user asks for the pending nonce of an account, we get it from the message pool.
+		nonce, err := a.Mpool.GetNonce(ctx, addr, ts.Key())
+		if err != nil {
+			return ethtypes.EthUint64(0), nil
+		}
+		return ethtypes.EthUint64(nonce), nil
+	} else {
+		return ethtypes.EthUint64(actor.Nonce), nil
 	}
-
-	nonce, err := a.Mpool.GetNonce(ctx, addr, ts.Key())
-	if err != nil {
-		return ethtypes.EthUint64(0), nil
-	}
-	return ethtypes.EthUint64(nonce), nil
 }
 
 func (a *EthModule) EthGetTransactionReceipt(ctx context.Context, txHash ethtypes.EthHash) (*api.EthTxReceipt, error) {
@@ -459,7 +505,7 @@ func (a *EthModule) EthGetCode(ctx context.Context, ethAddr ethtypes.EthAddress,
 		return nil, xerrors.Errorf("cannot get Filecoin address: %w", err)
 	}
 
-	ts, err := a.parseBlkParam(ctx, blkParam, false)
+	ts, err := a.blkParamToTipsetAfter(ctx, blkParam)
 	if err != nil {
 		return nil, xerrors.Errorf("cannot parse block param: %s", blkParam)
 	}
@@ -538,7 +584,7 @@ func (a *EthModule) EthGetCode(ctx context.Context, ethAddr ethtypes.EthAddress,
 }
 
 func (a *EthModule) EthGetStorageAt(ctx context.Context, ethAddr ethtypes.EthAddress, position ethtypes.EthBytes, blkParam string) (ethtypes.EthBytes, error) {
-	ts, err := a.parseBlkParam(ctx, blkParam, false)
+	ts, err := a.blkParamToTipsetAfter(ctx, blkParam)
 	if err != nil {
 		return nil, xerrors.Errorf("cannot parse block param: %s", blkParam)
 	}
@@ -634,17 +680,12 @@ func (a *EthModule) EthGetBalance(ctx context.Context, address ethtypes.EthAddre
 		return ethtypes.EthBigInt{}, err
 	}
 
-	ts, err := a.parseBlkParam(ctx, blkParam, false)
+	ts, err := a.blkParamToTipsetAfter(ctx, blkParam)
 	if err != nil {
 		return ethtypes.EthBigInt{}, xerrors.Errorf("cannot parse block param: %s", blkParam)
 	}
 
-	st, _, err := a.StateManager.TipSetState(ctx, ts)
-	if err != nil {
-		return ethtypes.EthBigInt{}, xerrors.Errorf("failed to compute tipset state: %w", err)
-	}
-
-	actor, err := a.StateManager.LoadActorRaw(ctx, filAddr, st)
+	actor, err := a.StateManager.LoadActor(ctx, filAddr, ts)
 	if xerrors.Is(err, types.ErrActorNotFound) {
 		return ethtypes.EthBigIntZero, nil
 	} else if err != nil {
@@ -679,7 +720,7 @@ func (a *EthModule) EthFeeHistory(ctx context.Context, p jsonrpc.RawParams) (eth
 		}
 	}
 
-	ts, err := a.parseBlkParam(ctx, params.NewestBlkNum, false)
+	ts, err := a.blkParamToTipset(ctx, params.NewestBlkNum, false)
 	if err != nil {
 		return ethtypes.EthFeeHistory{}, fmt.Errorf("bad block parameter %s: %s", params.NewestBlkNum, err)
 	}
@@ -1055,7 +1096,7 @@ func (a *EthModule) EthCall(ctx context.Context, tx ethtypes.EthCall, blkParam s
 		return nil, xerrors.Errorf("failed to convert ethcall to filecoin message: %w", err)
 	}
 
-	ts, err := a.parseBlkParam(ctx, blkParam, false)
+	ts, err := a.blkParamToTipset(ctx, blkParam, false)
 	if err != nil {
 		return nil, xerrors.Errorf("cannot parse block param: %s", blkParam)
 	}
