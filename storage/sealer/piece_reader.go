@@ -33,25 +33,20 @@ type pieceReader struct {
 	closed bool
 	seqAt  int64 // next byte to be read by io.Reader
 
-	mu  sync.Mutex
-	r   io.ReadCloser
-	br  *bufio.Reader
-	rAt int64
+	mu   sync.Mutex
+	pool *sync.Pool
+	lru  *lruCache
 }
 
 func (p *pieceReader) init() (_ *pieceReader, err error) {
 	stats.Record(p.ctx, metrics.DagStorePRInitCount.M(1))
 
-	p.rAt = 0
-	p.r, err = p.getReader(p.ctx, uint64(p.rAt))
-	if err != nil {
-		return nil, err
+	// Initialize the pool and LRU cache
+	p.pool = &sync.Pool{}
+	p.lru = newLRUCache(5) // Adjust the cache size based on your requirements
+	p.pool.New = func() interface{} {
+		return p.getReader(uint64(p.seqAt))
 	}
-	if p.r == nil {
-		return nil, nil
-	}
-
-	p.br = bufio.NewReaderSize(p.r, ReadBuf)
 
 	return p, nil
 }
@@ -138,61 +133,33 @@ func (p *pieceReader) readAtUnlocked(b []byte, off int64) (n int, err error) {
 
 	stats.Record(p.ctx, metrics.DagStorePRBytesRequested.M(int64(len(b))))
 
-	// 1. Get the backing reader into the correct position
-
-	// if the backing reader is ahead of the offset we want, or more than
-	//  MaxPieceReaderBurnBytes behind, reset the reader
-	if p.r == nil || p.rAt > off || p.rAt+MaxPieceReaderBurnBytes < off {
-		if p.r != nil {
-			if err := p.r.Close(); err != nil {
-				return 0, xerrors.Errorf("closing backing reader: %w", err)
-			}
-			p.r = nil
-			p.br = nil
-		}
-
-		log.Debugw("pieceReader new stream", "piece", p.pieceCid, "at", p.rAt, "off", off-p.rAt, "n", len(b))
-
-		if off > p.rAt {
-			stats.Record(p.ctx, metrics.DagStorePRSeekForwardBytes.M(off-p.rAt), metrics.DagStorePRSeekForwardCount.M(1))
-		} else {
-			stats.Record(p.ctx, metrics.DagStorePRSeekBackBytes.M(p.rAt-off), metrics.DagStorePRSeekBackCount.M(1))
-		}
-
-		p.rAt = off
-		p.r, err = p.getReader(p.ctx, uint64(p.rAt))
-		p.br = bufio.NewReaderSize(p.r, ReadBuf)
+	// Check if we have an existing reader in the LRU cache
+	reader, ok := p.lru.get(off)
+	if !ok {
+		// Acquire a reader from the pool or create a new one if necessary
+		reader = p.pool.Get().(io.ReadCloser)
+		_, err = reader.Seek(off, io.SeekStart)
 		if err != nil {
-			return 0, xerrors.Errorf("getting backing reader: %w", err)
+			return 0, err
 		}
+		p.lru.add(off, reader)
 	}
 
-	// 2. Check if we need to burn some bytes
-	if off > p.rAt {
-		stats.Record(p.ctx, metrics.DagStorePRBytesDiscarded.M(off-p.rAt), metrics.DagStorePRDiscardCount.M(1))
+	// Create a bufio.Reader to buffer the read
+	br := bufio.NewReaderSize(reader, ReadBuf)
 
-		n, err := io.CopyN(io.Discard, p.br, off-p.rAt)
-		p.rAt += n
-		if err != nil {
-			return 0, xerrors.Errorf("discarding read gap: %w", err)
-		}
-	}
-
-	// 3. Sanity check
-	if off != p.rAt {
-		return 0, xerrors.Errorf("bad reader offset; requested %d; at %d", off, p.rAt)
-	}
-
-	// 4. Read!
-	n, err = io.ReadFull(p.br, b)
+	n, err = io.ReadFull(br, b)
 	if n < len(b) {
-		log.Debugw("pieceReader short read", "piece", p.pieceCid, "at", p.rAt, "toEnd", int64(p.len)-p.rAt, "n", len(b), "read", n, "err", err)
+		log.Debugw("pieceReader short read", "piece", p.pieceCid, "at", off, "toEnd", int64(p.len)-off, "n", len(b), "read", n, "err", err)
 	}
 	if err == io.ErrUnexpectedEOF {
 		err = io.EOF
 	}
 
-	p.rAt += int64(n)
+	// Update the LRU cache and return the reader to the pool
+	p.lru.touch(off)
+	p.pool.Put(reader)
+
 	return n, err
 }
 
