@@ -23,11 +23,14 @@ import (
 var MaxPieceReaderBurnBytes int64 = 1 << 20 // 1M
 var ReadBuf = 128 * (127 * 8)               // unpadded(128k)
 
+type pieceGetter func(ctx context.Context, offset uint64) (io.ReadCloser, error)
+
 type pieceReader struct {
-	ctx      context.Context
-	pieceCid cid.Cid
-	len      abi.UnpaddedPieceSize
-	onClose  context.CancelFunc
+	ctx       context.Context
+	getReader pieceGetter
+	pieceCid  cid.Cid
+	len       abi.UnpaddedPieceSize
+	onClose   context.CancelFunc
 
 	closed bool
 	seqAt  int64 // next byte to be read by io.Reader
@@ -48,6 +51,17 @@ type lruCache struct {
 type lruCacheEntry struct {
 	offset uint64
 	reader io.ReadCloser
+}
+
+func newPieceReader(ctx context.Context, pieceCid cid.Cid, len abi.UnpaddedPieceSize, onClose context.CancelFunc, getReader pieceGetter) (*pieceReader, error) {
+	p := &pieceReader{
+		ctx:       ctx,
+		pieceCid:  pieceCid,
+		len:       len,
+		onClose:   onClose,
+		getReader: getReader,
+	}
+	return p.init()
 }
 
 func newLRUCache(size int) *lruCache {
@@ -152,6 +166,10 @@ func (p *pieceReader) Close() error {
 	p.closed = true
 
 	return nil
+}
+
+func (p *pieceReader) readerAt(offset uint64) (io.ReadCloser, error) {
+	return p.getReader(p.ctx, offset)
 }
 
 func (p *pieceReader) Read(b []byte) (int, error) {
