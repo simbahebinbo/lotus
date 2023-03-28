@@ -18,7 +18,7 @@ import (
 	"github.com/filecoin-project/lotus/metrics"
 )
 
-// For small read skips, it's faster to "burn" some bytes than to setup new sector reader.
+// For small read skips, it's faster to "burn" some bytes than to setup a new sector reader.
 // Assuming 1ms stream seek latency, and 1G/s stream rate, we're willing to discard up to 1 MiB.
 var MaxPieceReaderBurnBytes int64 = 1 << 20 // 1M
 var ReadBuf = 128 * (127 * 8)               // unpadded(128k)
@@ -106,7 +106,7 @@ func (p *pieceReader) init() (_ *pieceReader, err error) {
 	p.pool = &sync.Pool{}
 	p.lru = newLRUCache(5) // Adjust the cache size based on your requirements
 	p.pool.New = func() interface{} {
-		reader, err := p.getReader(p.ctx, uint64(p.seqAt))
+		reader, err := p.readerAt(uint64(p.seqAt))
 		if err != nil {
 			log.Errorw("error creating reader for pool",
 				"pieceCid", p.pieceCid,
@@ -136,6 +136,8 @@ func (p *pieceReader) Close() error {
 		return err
 	}
 
+	defer p.onClose()
+
 	// Close and release any acquired readers
 	for el := p.lru.lruList.Front(); el != nil; el = el.Next() {
 		if el.Value != nil {
@@ -146,8 +148,6 @@ func (p *pieceReader) Close() error {
 			}
 		}
 	}
-
-	p.onClose()
 
 	p.closed = true
 
@@ -235,8 +235,10 @@ func (p *pieceReader) readAtUnlocked(b []byte, off int64) (n int, err error) {
 	}
 
 	// Update the LRU cache and return the reader to the pool
-	p.lru.touch(uint64(off))
-	p.pool.Put(reader)
+	defer func() {
+		p.lru.touch(uint64(off))
+		p.pool.Put(reader)
+	}()
 
 	return n, err
 }
